@@ -10,10 +10,6 @@ from datetime import datetime
 
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
-# Vivaticket API endpoint for event sessions/dates
-API_URL = "https://www.vivaticket.com/it/api/event/sessions?eventId=151991&lang=en"
-API_URL2 = "https://cenacolovinciano.vivaticket.it/it/api/event/sessions?eventId=151991"
-
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
@@ -29,93 +25,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 last_status = None
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-    "Referer": "https://cenacolovinciano.vivaticket.it/",
-    "Origin": "https://cenacolovinciano.vivaticket.it",
-}
-
-
-def check_via_api():
-    """Try vivaticket's own API endpoints for session availability."""
-    for url in [API_URL, API_URL2]:
-        try:
-            log.info(f"Trying API: {url}")
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            log.info(f"API status: {resp.status_code}, size: {len(resp.text)} bytes")
-            log.info(f"API response: {resp.text[:500]}")
-            if resp.status_code == 200 and len(resp.text) > 10:
-                return resp.text
-        except Exception as e:
-            log.warning(f"API call failed: {e}")
-    return None
-
-
-def check_via_page_js(html):
-    """Extract availability from JavaScript variables embedded in the page."""
-    # Look for JS patterns that indicate session/slot data
-    patterns = [
-        r'sessions?\s*[=:]\s*(\[.*?\])',
-        r'dates?\s*[=:]\s*(\[.*?\])',
-        r'slots?\s*[=:]\s*(\[.*?\])',
-        r'"available"\s*:\s*(true|false)',
-        r'"availability"\s*:\s*(\d+)',
-        r'availab\w+\s*[=:]\s*(\w+)',
-        r'"sold_?out"\s*:\s*(true|false)',
-        r'soldOut\s*[=:]\s*(true|false)',
-        r'remaining\s*[=:]\s*(\d+)',
-        r'"qty"\s*:\s*(\d+)',
-        r'"quantity"\s*:\s*(\d+)',
-    ]
-
-    found_any = False
-    for pattern in patterns:
-        matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
-        if matches:
-            found_any = True
-            log.info(f"  JS pattern '{pattern}': {matches[:3]}")
-
-    return found_any
-
-
-def analyze_html(html):
-    """Full analysis of page HTML/JS for availability signals."""
-    text = html.lower()
-    log.info(f"Page size: {len(html)} bytes")
-
-    # Look for JS-embedded availability data
-    check_via_page_js(html)
-
-    # Log all keyword occurrences with context
-    for keyword in ["esaurito", "sold", "acquista", "add to cart", "compra",
-                    "aggiungi", "buy now", "disponib", "available", "unavailable",
-                    "session", "slot", "remaining", "qty", "quantity"]:
-        idx = text.find(keyword)
-        if idx != -1:
-            snippet = text[max(0, idx-40):idx+70].replace("\n", " ").strip()
-            log.info(f"  '{keyword}': ...{snippet}...")
-
-    # Hard sold-out: whole event marked unavailable
-    hard_sold = ["esaurito", "biglietti esauriti", "nessuna data disponibile",
-                 "no dates available", "evento non disponibile"]
-    # Definitive available: action buttons or JS true availability
-    definitive_avail = ["aggiungi al carrello", "add to cart", "compra ora",
-                        "buy now", "acquista ora", '"available":true', '"available": true',
-                        'available:true', '"soldout":false', '"sold_out":false']
-
-    is_avail = any(s in text for s in definitive_avail)
-    is_sold = any(s in text for s in hard_sold)
-
-    log.info(f"  -> Available signals: {is_avail} | Sold-out signals: {is_sold}")
-
-    if is_avail:
-        return "available"
-    elif is_sold:
-        return "sold_out"
-    return "unknown"
 
 
 def fetch_with_zenrows():
@@ -140,24 +49,61 @@ def fetch_with_scraperapi():
     return resp.text
 
 
-def check_availability():
-    # Step 1: Try the API directly (cheapest, no scraping credits used)
-    api_data = check_via_api()
-    if api_data:
-        data_lower = api_data.lower()
-        # Check for available slots in API response
-        if any(x in data_lower for x in ['"available":true', '"available": true',
-                                           '"soldout":false', '"qty":', '"remaining":']):
-            # Parse more carefully
-            avail_count = data_lower.count('"available":true') + data_lower.count('"available": true')
-            sold_count = data_lower.count('"available":false') + data_lower.count('"available": false')
-            log.info(f"API: {avail_count} available slots, {sold_count} unavailable slots")
-            if avail_count > 0:
-                return "available"
-            elif sold_count > 0 and avail_count == 0:
-                return "sold_out"
+def analyze_html(html):
+    log.info(f"Page size: {len(html)} bytes")
 
-    # Step 2: Fetch the full page with JS rendering
+    # Strip tags and get clean text
+    clean = re.sub(r'<[^>]+>', ' ', html)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+
+    # Log a large chunk of the visible text so we can see what buttons/text exist
+    log.info(f"=== PAGE TEXT (first 1500 chars) ===")
+    log.info(clean[:750])
+    log.info(clean[750:1500])
+    log.info(f"=== END PAGE TEXT ===")
+
+    # Also search for the sell_online section specifically
+    sell_idx = html.lower().find('sell_online')
+    if sell_idx != -1:
+        section = html[sell_idx:sell_idx+2000]
+        section_clean = re.sub(r'<[^>]+>', ' ', section)
+        section_clean = re.sub(r'\s+', ' ', section_clean).strip()
+        log.info(f"=== sell_online SECTION ===")
+        log.info(section_clean[:800])
+        log.info(f"=== END sell_online ===")
+
+    # Search for any input/button/link text
+    buttons = re.findall(r'<(?:button|input|a)[^>]*>([^<]{2,60})</(?:button|a)>', html, re.IGNORECASE)
+    if buttons:
+        log.info(f"Buttons/links found: {buttons[:20]}")
+
+    text = html.lower()
+
+    # Hard sold-out signals
+    hard_sold = ["esaurito", "biglietti esauriti", "nessuna data disponibile",
+                 "no dates available", "evento non disponibile"]
+    # Any of these in the sell section = available
+    avail_signals = ["aggiungi al carrello", "add to cart", "compra ora",
+                     "buy now", "acquista ora", "select tickets",
+                     '"available":true', '"available": true',
+                     '"soldout":false', '"sold_out":false',
+                     'type="submit"', "proceed to checkout", "checkout"]
+
+    is_avail = any(s in text for s in avail_signals)
+    is_sold = any(s in text for s in hard_sold)
+
+    log.info(f"Available signals: {is_avail} | Sold-out signals: {is_sold}")
+
+    if is_avail and not is_sold:
+        return "available"
+    elif is_sold and not is_avail:
+        return "sold_out"
+    elif is_avail and is_sold:
+        return "available"  # some dates available, some not
+    return "unknown"
+
+
+def check_availability():
     for name, fn in [("ZenRows", fetch_with_zenrows), ("ScraperAPI", fetch_with_scraperapi)]:
         try:
             log.info(f"Trying {name}...")
@@ -165,11 +111,10 @@ def check_availability():
             if html and len(html) > 500:
                 log.info(f"{name} succeeded ({len(html)} bytes)")
                 return analyze_html(html)
-            log.warning(f"{name} too small")
+            log.warning(f"{name} too small ({len(html) if html else 0} bytes)")
         except Exception as e:
             log.warning(f"{name} failed: {e}")
-
-    log.error("All methods failed")
+    log.error("All fetch methods failed")
     return "error"
 
 

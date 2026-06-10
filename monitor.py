@@ -1,6 +1,6 @@
 import os
-import re
 import time
+import json
 import logging
 import requests
 from datetime import datetime, date
@@ -8,10 +8,11 @@ from datetime import datetime, date
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
 API_URL = "https://cenacolovinciano.vivaticket.it/eventoWidgetTlite.php"
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # 5 min default
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
+COOKIE = os.environ.get("VIVATICKET_COOKIE")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,85 +23,42 @@ log = logging.getLogger(__name__)
 
 last_available_sessions = None
 
-# Target sessions for Aug 18 and 19
-# session_id = from eventi array; pcodes = time slot IDs within the session
-# pcodes are unknown until dates become available — we detect via session-level API
 TARGET_SESSIONS = [
     {"session_id": "13792815", "shop_id": "vt0005655", "date": date(2026, 8, 18)},
     {"session_id": "13792822", "shop_id": "vt0005655", "date": date(2026, 8, 19)},
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-    "Referer": TARGET_URL,
-    "X-Requested-With": "XMLHttpRequest",
-    "Origin": "https://cenacolovinciano.vivaticket.it",
-}
 
-
-def check_session_via_page(session):
-    """
-    Fetch the calendar detail page for a specific session.
-    This is the page that loads when you click a date on the calendar.
-    Look for available time slots (green buttons with pcode links).
-    """
-    # This URL loads the timetable for a specific session
-    url = (
-        f"https://cenacolovinciano.vivaticket.it/index.php"
-        f"?nvpg[sell]&cmd=calendar_detail&show_id=151991"
-        f"&session_id={session['session_id']}&tcode={session['shop_id']}"
-    )
+def get_session_slots(session):
+    """Call eventoWidgetTlite.php with browser cookie to bypass Incapsula."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": TARGET_URL,
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": "https://cenacolovinciano.vivaticket.it",
+        "Cookie": COOKIE or "",
+    }
+    data = {
+        "ajax": "1",
+        "cal": "1",
+        "tcode": session["shop_id"],
+        "pcode": session["session_id"],
+        "seat-filter": "undefined",
+    }
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        html = resp.text
-        log.info(f"  Session page {session['date']}: {len(html)} bytes, status {resp.status_code}")
-
-        # Log a text sample
-        clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
-        log.info(f"  Text sample: {clean[:400]}")
-
-        # Look for available slot indicators
-        # Available slots have links with pcode, unavailable don't
-        pcodes = re.findall(r'pcode=(\d+)', html)
-        log.info(f"  pcodes found: {pcodes[:10]}")
-
-        avail = re.findall(r'title="(\d+)\s+seat', html, re.IGNORECASE)
-        log.info(f"  seat titles found: {avail}")
-
-        if pcodes or avail:
-            return True, pcodes
-        return False, []
+        resp = requests.post(API_URL, data=data, headers=headers, timeout=15)
+        log.info(f"  {session['date']}: status={resp.status_code} body={resp.text[:200]}")
+        if resp.status_code == 200 and resp.text.strip().startswith("["):
+            slots = resp.json()
+            available = [s for s in slots if str(s.get("d", "0")) == "1"]
+            return available
+        return []
     except Exception as e:
-        log.warning(f"  Page fetch failed for {session['date']}: {e}")
-        return False, []
-
-
-def check_session_via_api(session):
-    """
-    Try the eventoWidgetTlite API with session_id directly.
-    Log full response for diagnosis.
-    """
-    # Try multiple pcode formats
-    attempts = [
-        {"ajax": "1", "cal": "1", "tcode": session["shop_id"], "pcode": session["session_id"], "seat-filter": "undefined"},
-        {"ajax": "1", "cal": "1", "tcode": session["shop_id"], "show_id": "151991", "session_id": session["session_id"]},
-        {"ajax": "1", "tcode": session["shop_id"], "pcode": session["session_id"]},
-    ]
-    for i, data in enumerate(attempts):
-        try:
-            resp = requests.post(API_URL, data=data, headers=HEADERS, timeout=15)
-            log.info(f"  API attempt {i+1}: status={resp.status_code} body={resp.text[:300]}")
-            if resp.status_code == 200 and resp.text.strip().startswith("["):
-                slots = resp.json()
-                available = [s for s in slots if str(s.get("d", "0")) == "1"]
-                if available:
-                    return True, available
-                return False, []
-        except Exception as e:
-            log.warning(f"  API attempt {i+1} failed: {e}")
-    return False, []
+        log.warning(f"  API call failed for {session['date']}: {e}")
+        return []
 
 
 def check_availability():
@@ -108,24 +66,16 @@ def check_availability():
     available_sessions = []
 
     for s in TARGET_SESSIONS:
-        log.info(f"Checking {s['date'].strftime('%d %b %Y')} (session {s['session_id']})...")
-
-        # Try page-based check first
-        is_avail, pcodes = check_session_via_page(s)
-
-        # Also try API
-        is_avail_api, slots = check_session_via_api(s)
-
-        if is_avail or is_avail_api:
-            log.info(f"  *** AVAILABLE! pcodes={pcodes} api_slots={slots}")
-            available_sessions.append({**s, "slots": slots or pcodes})
+        slots = get_session_slots(s)
+        if slots:
+            times = ", ".join(slot.get("ora", "?") for slot in slots)
+            log.info(f"  {s['date'].strftime('%d %b %Y')}: AVAILABLE at {times}")
+            available_sessions.append({**s, "slots": slots})
         else:
-            log.info(f"  Sold out")
+            log.info(f"  {s['date'].strftime('%d %b %Y')}: sold out")
         time.sleep(0.5)
 
-    if available_sessions:
-        return "available", available_sessions
-    return "sold_out", []
+    return ("available", available_sessions) if available_sessions else ("sold_out", [])
 
 
 def send_email_alert(available_sessions):
@@ -135,21 +85,22 @@ def send_email_alert(available_sessions):
 
     rows = ""
     for s in available_sessions:
+        times = ", ".join(slot.get("ora", "?") for slot in s["slots"])
         rows += (
             f"<tr>"
             f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['date'].strftime('%A, %d %B %Y')}</td>"
-            f"<td style='padding:8px 12px;border-bottom:1px solid #eee;color:#3B6D11;font-weight:bold'>Available!</td>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee;color:#3B6D11;font-weight:bold'>{times}</td>"
             f"</tr>"
         )
 
     html_body = (
         "<html><body style='font-family:sans-serif;max-width:580px;margin:auto;padding:24px'>"
         "<h2 style='color:#3B6D11'>🎨 Last Supper tickets available!</h2>"
-        "<p>Availability detected for your target dates — act fast!</p>"
+        "<p>The following dates and times have availability — act fast!</p>"
         "<table style='width:100%;border-collapse:collapse;margin:16px 0'>"
         "<thead><tr style='background:#f5f5f5'>"
         "<th style='padding:8px 12px;text-align:left'>Date</th>"
-        "<th style='padding:8px 12px;text-align:left'>Status</th>"
+        "<th style='padding:8px 12px;text-align:left'>Available times</th>"
         "</tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         f"<p><a href='{TARGET_URL}' style='background:#185FA5;color:#fff;padding:12px 24px;"
@@ -186,6 +137,8 @@ def main():
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
     log.info(f"Watching: Aug 18 & Aug 19 2026")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
+    if not COOKIE:
+        log.warning("VIVATICKET_COOKIE not set — requests may be blocked")
 
     while True:
         log.info("Checking availability...")

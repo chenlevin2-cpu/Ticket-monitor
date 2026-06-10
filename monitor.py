@@ -7,12 +7,12 @@ from datetime import datetime, date
 
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
+BASE_URL = "https://cenacolovinciano.vivaticket.it"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,15 +21,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-last_available_slots = None
+last_available_sessions = None
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    "Referer": "https://cenacolovinciano.vivaticket.it/",
+}
 
 
-def fetch_with_zenrows():
+def fetch_main_page():
+    """Fetch main page via ZenRows to get the eventi array with session IDs."""
     params = {
         "apikey": ZENROWS_API_KEY,
         "url": TARGET_URL,
         "js_render": "true",
-        "wait": "5000",
+        "wait": "3000",
         "premium_proxy": "true",
     }
     resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=90)
@@ -37,115 +45,120 @@ def fetch_with_zenrows():
     return resp.text
 
 
-def fetch_with_scraperapi():
-    if not SCRAPER_API_KEY:
-        raise Exception("No SCRAPER_API_KEY")
-    url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={TARGET_URL}&render=true&country_code=it"
-    resp = requests.get(url, timeout=90)
-    resp.raise_for_status()
-    return resp.text
+def parse_sessions(html):
+    """Parse eventi JS array to get all session IDs and dates."""
+    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\)"
+    matches = re.findall(pattern, html)
+    sessions = []
+    for shop_id, session_id, year, month, day in matches:
+        try:
+            sessions.append({
+                "session_id": session_id,
+                "shop_id": shop_id,
+                "date": date(int(year), int(month), int(day)),
+            })
+        except Exception:
+            pass
+    return sessions
 
 
-def parse_available_slots(html):
-    slots = []
+def check_session_availability(session):
+    """
+    Check a specific session by fetching its ticket selection page directly.
+    URL: /index.php?nvpg[sell]&cmd=calendar_detail&show_id=151991&session_id=XXXXX&tcode=vt0005655
+    """
+    url = (
+        f"{BASE_URL}/index.php?nvpg[sell]&cmd=calendar_detail"
+        f"&show_id=151991&session_id={session['session_id']}&tcode={session['shop_id']}"
+    )
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        html = resp.text.lower()
 
-    # Log what's around key terms for diagnosis
-    for term in ["seat", "pcode", "nvpg", "sell", "prices"]:
-        idx = html.lower().find(term)
-        if idx != -1:
-            snippet = html[max(0, idx-80):idx+120].replace("\n", " ")
-            log.info(f"  '{term}' found: ...{snippet}...")
-        else:
-            log.info(f"  '{term}': NOT FOUND in page")
+        # Available if we see seat/ticket purchase options
+        avail_signals = ["add to cart", "aggiungi", "acquista", "seats available",
+                         "posti disponibili", "select", "buy", "compra", "title="]
+        sold_signals = ["sold out", "esaurito", "no availability", "not available"]
 
-    # Pattern 1: pcode in URL + title="N seats"
-    p1 = re.findall(r'pcode=(\d+)[^"]*"[^>]*title="(\d+)\s+seat[s]?"[^>]*>([^<]{1,20})</a>', html, re.IGNORECASE)
-    if p1:
-        log.info(f"Pattern 1 matches: {p1[:5]}")
-        for pcode, seats, t in p1:
-            slots.append({"pcode": pcode, "seats": int(seats), "time": t.strip()})
-        return slots
+        is_avail = any(s in html for s in avail_signals)
+        is_sold = any(s in html for s in sold_signals)
 
-    # Pattern 2: title="N seats" anywhere
-    p2 = re.findall(r'title="(\d+)\s+seat[s]?"', html, re.IGNORECASE)
-    if p2:
-        log.info(f"Pattern 2 (seat titles): {p2[:10]}")
-        for seats in p2:
-            slots.append({"pcode": "unknown", "seats": int(seats), "time": ""})
-        return slots
+        # Also look for seat count pattern
+        seat_match = re.search(r'(\d+)\s+seat[s]?\s+available', html)
+        if seat_match:
+            return True, int(seat_match.group(1))
 
-    # Pattern 3: look for the eventi array field that indicates availability
-    # Format: ('shopId','sessionId', date, 'STATUS', capacity, 'FLAG')
-    # Try to find entries where field 4 or 6 is '1' instead of '0'
-    p3 = re.findall(r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date[^)]+\),\s*'(\d+)',\s*(\d+),\s*'(\d+)'\s*\)\s*\)", html)
-    if p3:
-        log.info(f"Pattern 3 (eventi array) sample: {p3[:3]}")
-        for shop, session, f4, capacity, f6 in p3:
-            log.info(f"  session={session} f4={f4} capacity={capacity} f6={f6}")
-
-    return slots
+        if is_avail and not is_sold:
+            return True, None
+        return False, None
+    except Exception as e:
+        log.warning(f"Failed to check session {session['session_id']}: {e}")
+        return False, None
 
 
 def check_availability():
-    html = None
-    for name, fn in [("ZenRows", fetch_with_zenrows), ("ScraperAPI", fetch_with_scraperapi)]:
-        try:
-            log.info(f"Trying {name}...")
-            html = fn()
-            if html and len(html) > 500:
-                log.info(f"{name} succeeded ({len(html)} bytes)")
-                break
-            html = None
-        except Exception as e:
-            log.warning(f"{name} failed: {e}")
-
-    if not html:
-        log.error("All fetch methods failed")
+    # Step 1: Get main page to extract all sessions
+    try:
+        log.info("Fetching main page for session list...")
+        html = fetch_main_page()
+        log.info(f"Main page: {len(html)} bytes")
+    except Exception as e:
+        log.error(f"Failed to fetch main page: {e}")
         return "error", []
 
-    slots = parse_available_slots(html)
-    log.info(f"Available slots found: {len(slots)}")
+    sessions = parse_sessions(html)
+    if not sessions:
+        log.warning("No sessions found in page")
+        return "unknown", []
 
-    if slots:
-        return "available", slots
-    else:
-        return "sold_out", []
+    log.info(f"Found {len(sessions)} sessions, checking each for availability...")
+
+    # Step 2: Check only the next 14 days to keep it fast
+    today = date.today()
+    upcoming = [s for s in sessions if (s["date"] - today).days <= 30]
+    log.info(f"Checking {len(upcoming)} sessions in next 30 days...")
+
+    available = []
+    for s in upcoming:
+        is_avail, seats = check_session_availability(s)
+        label = f"{seats} seats" if seats else "available"
+        log.info(f"  {s['date'].strftime('%d %b %Y')} ({s['session_id']}): {'AVAILABLE - ' + label if is_avail else 'sold out'}")
+        if is_avail:
+            available.append({**s, "seats": seats})
+        time.sleep(0.5)  # be gentle
+
+    if available:
+        return "available", available
+    return "sold_out", []
 
 
-def send_email_alert(available_slots):
+def send_email_alert(available_sessions):
     if not SENDGRID_API_KEY:
         log.error("SENDGRID_API_KEY not set")
         return
-    if not RECIPIENT_EMAIL or not SENDER_EMAIL:
-        log.error("RECIPIENT_EMAIL or SENDER_EMAIL not set")
-        return
 
     rows = ""
-    for s in available_slots:
-        pcode = s["pcode"]
-        link = f"https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode={pcode}&tcode=vt0005655"
-        book = f"<a href='{link}' style='color:#185FA5'>Book</a>" if pcode != "unknown" else ""
+    for s in available_sessions:
+        seats_str = f"{s['seats']} seats" if s.get("seats") else "available"
         rows += (
             f"<tr>"
-            f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['time']}</td>"
-            f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{s['seats']} seats</td>"
-            f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{book}</td>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['date'].strftime('%A, %d %B %Y')}</td>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{seats_str}</td>"
             f"</tr>"
         )
 
     html_body = (
         "<html><body style='font-family:sans-serif;max-width:580px;margin:auto;padding:24px'>"
         "<h2 style='color:#3B6D11'>Last Supper tickets available!</h2>"
-        "<p>The following time slots are bookable right now — act fast!</p>"
+        "<p>The following dates have availability — act fast!</p>"
         "<table style='width:100%;border-collapse:collapse;margin:16px 0'>"
         "<thead><tr style='background:#f5f5f5'>"
-        "<th style='padding:8px 12px;text-align:left'>Time</th>"
-        "<th style='padding:8px 12px;text-align:center'>Seats</th>"
-        "<th style='padding:8px 12px;text-align:left'>Link</th>"
+        "<th style='padding:8px 12px;text-align:left'>Date</th>"
+        "<th style='padding:8px 12px;text-align:center'>Availability</th>"
         "</tr></thead>"
         f"<tbody>{rows}</tbody></table>"
         f"<p><a href='{TARGET_URL}' style='background:#185FA5;color:#fff;padding:12px 24px;"
-        "border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px'>Open booking page</a></p>"
+        "border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px'>Book now</a></p>"
         f"<p style='color:#888;font-size:12px'>Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>"
         "</body></html>"
     )
@@ -153,7 +166,7 @@ def send_email_alert(available_slots):
     payload = {
         "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
         "from": {"email": SENDER_EMAIL},
-        "subject": f"Last Supper — {len(available_slots)} slot(s) available now!",
+        "subject": f"Last Supper — {len(available_sessions)} date(s) available!",
         "content": [{"type": "text/html", "value": html_body}]
     }
 
@@ -173,24 +186,24 @@ def send_email_alert(available_slots):
 
 
 def main():
-    global last_available_slots
+    global last_available_sessions
     log.info("=== Cenacolo Vinciano Ticket Monitor Started ===")
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
 
     while True:
         log.info("Checking availability...")
-        status, available_slots = check_availability()
+        status, available_sessions = check_availability()
         log.info(f"Status: {status}")
 
         if status == "available":
-            current_pcodes = set(s["pcode"] for s in available_slots)
-            if last_available_slots is None or not current_pcodes.issubset(last_available_slots):
-                log.info("New slots — sending alert!")
-                send_email_alert(available_slots)
-            last_available_slots = current_pcodes
+            current_ids = set(s["session_id"] for s in available_sessions)
+            if last_available_sessions is None or not current_ids.issubset(last_available_sessions):
+                log.info("New availability — sending alert!")
+                send_email_alert(available_sessions)
+            last_available_sessions = current_ids
         else:
-            last_available_slots = set()
+            last_available_sessions = set()
 
         log.info(f"Next check in {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)

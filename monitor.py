@@ -47,38 +47,43 @@ def fetch_with_scraperapi():
 
 
 def parse_available_slots(html):
-    """
-    Find all available time slots by looking for links with title="N seats".
-    Example: <a href="...&pcode=13771949&tcode=vt0005655" title="3 seats">12.30</a>
-    Returns list of dicts with pcode, seats, time.
-    """
-    # Match: pcode=XXXXXXX...title="N seats">TIME
-    pattern = r'pcode=(\d+)[^"]*"[^>]*title="(\d+)\s+seats?"[^>]*>([^<]+)</a>'
-    matches = re.findall(pattern, html, re.IGNORECASE)
-
     slots = []
-    for pcode, seats, time_str in matches:
-        slots.append({
-            "pcode": pcode,
-            "seats": int(seats),
-            "time": time_str.strip(),
-        })
+
+    # Log what's around key terms for diagnosis
+    for term in ["seat", "pcode", "nvpg", "sell", "prices"]:
+        idx = html.lower().find(term)
+        if idx != -1:
+            snippet = html[max(0, idx-80):idx+120].replace("\n", " ")
+            log.info(f"  '{term}' found: ...{snippet}...")
+        else:
+            log.info(f"  '{term}': NOT FOUND in page")
+
+    # Pattern 1: pcode in URL + title="N seats"
+    p1 = re.findall(r'pcode=(\d+)[^"]*"[^>]*title="(\d+)\s+seat[s]?"[^>]*>([^<]{1,20})</a>', html, re.IGNORECASE)
+    if p1:
+        log.info(f"Pattern 1 matches: {p1[:5]}")
+        for pcode, seats, t in p1:
+            slots.append({"pcode": pcode, "seats": int(seats), "time": t.strip()})
+        return slots
+
+    # Pattern 2: title="N seats" anywhere
+    p2 = re.findall(r'title="(\d+)\s+seat[s]?"', html, re.IGNORECASE)
+    if p2:
+        log.info(f"Pattern 2 (seat titles): {p2[:10]}")
+        for seats in p2:
+            slots.append({"pcode": "unknown", "seats": int(seats), "time": ""})
+        return slots
+
+    # Pattern 3: look for the eventi array field that indicates availability
+    # Format: ('shopId','sessionId', date, 'STATUS', capacity, 'FLAG')
+    # Try to find entries where field 4 or 6 is '1' instead of '0'
+    p3 = re.findall(r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date[^)]+\),\s*'(\d+)',\s*(\d+),\s*'(\d+)'\s*\)\s*\)", html)
+    if p3:
+        log.info(f"Pattern 3 (eventi array) sample: {p3[:3]}")
+        for shop, session, f4, capacity, f6 in p3:
+            log.info(f"  session={session} f4={f4} capacity={capacity} f6={f6}")
 
     return slots
-
-
-def parse_sessions(html):
-    """Parse the eventi JS array to map session IDs to dates."""
-    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\)"
-    matches = re.findall(pattern, html)
-    sessions = {}
-    for m in matches:
-        _, session_id, year, month, day = m
-        try:
-            sessions[session_id] = date(int(year), int(month), int(day))
-        except Exception:
-            pass
-    return sessions
 
 
 def check_availability():
@@ -98,59 +103,57 @@ def check_availability():
         log.error("All fetch methods failed")
         return "error", []
 
-    # Find available slots (links with "N seats" title)
     slots = parse_available_slots(html)
-    log.info(f"Available time slots found: {len(slots)}")
-    for s in slots:
-        log.info(f"  pcode={s['pcode']} time={s['time']} seats={s['seats']}")
+    log.info(f"Available slots found: {len(slots)}")
 
     if slots:
         return "available", slots
     else:
-        log.info("No available slots found — all sold out")
         return "sold_out", []
 
 
 def send_email_alert(available_slots):
     if not SENDGRID_API_KEY:
-        log.error("SENDGRID_API_KEY not set — sign up free at sendgrid.com")
+        log.error("SENDGRID_API_KEY not set")
         return
     if not RECIPIENT_EMAIL or not SENDER_EMAIL:
         log.error("RECIPIENT_EMAIL or SENDER_EMAIL not set")
         return
 
-    rows = "".join(
-        f"<tr>"
-        f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['time']}</td>"
-        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{s['seats']} seats</td>"
-        f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>"
-        "<a href='https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode=" + s['pcode'] + "&tcode=vt0005655' style='color:#185FA5'>Book this slot</a>"
-        f"</td></tr>"
-        for s in available_slots
-    )
+    rows = ""
+    for s in available_slots:
+        pcode = s["pcode"]
+        link = f"https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode={pcode}&tcode=vt0005655"
+        book = f"<a href='{link}' style='color:#185FA5'>Book</a>" if pcode != "unknown" else ""
+        rows += (
+            f"<tr>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['time']}</td>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{s['seats']} seats</td>"
+            f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{book}</td>"
+            f"</tr>"
+        )
 
-    html_body = f"""
-    <html><body style="font-family:sans-serif;max-width:580px;margin:auto;padding:24px;">
-      <h2 style="color:#3B6D11;">🎨 Last Supper tickets available!</h2>
-      <p>The following time slots are bookable right now — act fast!</p>
-      <table style="width:100%;border-collapse:collapse;margin:16px 0">
-        <thead><tr style="background:#f5f5f5">
-          <th style="padding:8px 12px;text-align:left">Time</th>
-          <th style="padding:8px 12px;text-align:center">Seats</th>
-          <th style="padding:8px 12px;text-align:left">Link</th>
-        </tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-      <p><a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
-        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Open booking page →</a></p>
-      <p style="color:#888;font-size:12px">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
-    </body></html>
-    """
+    html_body = (
+        "<html><body style='font-family:sans-serif;max-width:580px;margin:auto;padding:24px'>"
+        "<h2 style='color:#3B6D11'>Last Supper tickets available!</h2>"
+        "<p>The following time slots are bookable right now — act fast!</p>"
+        "<table style='width:100%;border-collapse:collapse;margin:16px 0'>"
+        "<thead><tr style='background:#f5f5f5'>"
+        "<th style='padding:8px 12px;text-align:left'>Time</th>"
+        "<th style='padding:8px 12px;text-align:center'>Seats</th>"
+        "<th style='padding:8px 12px;text-align:left'>Link</th>"
+        "</tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
+        f"<p><a href='{TARGET_URL}' style='background:#185FA5;color:#fff;padding:12px 24px;"
+        "border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px'>Open booking page</a></p>"
+        f"<p style='color:#888;font-size:12px'>Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>"
+        "</body></html>"
+    )
 
     payload = {
         "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
         "from": {"email": SENDER_EMAIL},
-        "subject": f"🎨 Last Supper — {len(available_slots)} slot(s) available now!",
+        "subject": f"Last Supper — {len(available_slots)} slot(s) available now!",
         "content": [{"type": "text/html", "value": html_body}]
     }
 
@@ -162,7 +165,7 @@ def send_email_alert(available_slots):
             timeout=30
         )
         if resp.status_code == 202:
-            log.info(f"✅ Alert email sent to {RECIPIENT_EMAIL}")
+            log.info(f"Alert email sent to {RECIPIENT_EMAIL}")
         else:
             log.error(f"SendGrid error {resp.status_code}: {resp.text}")
     except Exception as e:
@@ -183,7 +186,7 @@ def main():
         if status == "available":
             current_pcodes = set(s["pcode"] for s in available_slots)
             if last_available_slots is None or not current_pcodes.issubset(last_available_slots):
-                log.info("New slots detected — sending alert!")
+                log.info("New slots — sending alert!")
                 send_email_alert(available_slots)
             last_available_slots = current_pcodes
         else:

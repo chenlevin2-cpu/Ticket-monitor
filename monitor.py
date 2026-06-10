@@ -107,13 +107,13 @@ def check_availability():
     if slots:
         return "available", slots
     else:
-        log.info("No available slots found ג€” all sold out")
+        log.info("No available slots found — all sold out")
         return "sold_out", []
 
 
 def send_email_alert(available_slots):
     if not SENDGRID_API_KEY:
-        log.error("SENDGRID_API_KEY not set ג€” sign up free at sendgrid.com")
+        log.error("SENDGRID_API_KEY not set — sign up free at sendgrid.com")
         return
     if not RECIPIENT_EMAIL or not SENDER_EMAIL:
         log.error("RECIPIENT_EMAIL or SENDER_EMAIL not set")
@@ -124,15 +124,15 @@ def send_email_alert(available_slots):
         f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['time']}</td>"
         f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{s['seats']} seats</td>"
         f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>"
-        f"<a href='https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode={s[\"pcode\"]}&tcode=vt0005655' style='color:#185FA5'>Book this slot</a>"
+        "<a href='https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode=" + s['pcode'] + "&tcode=vt0005655' style='color:#185FA5'>Book this slot</a>"
         f"</td></tr>"
         for s in available_slots
     )
 
     html_body = f"""
     <html><body style="font-family:sans-serif;max-width:580px;margin:auto;padding:24px;">
-      <h2 style="color:#3B6D11;">נ¨ Last Supper tickets available!</h2>
-      <p>The following time slots are bookable right now ג€” act fast!</p>
+      <h2 style="color:#3B6D11;">🎨 Last Supper tickets available!</h2>
+      <p>The following time slots are bookable right now — act fast!</p>
       <table style="width:100%;border-collapse:collapse;margin:16px 0">
         <thead><tr style="background:#f5f5f5">
           <th style="padding:8px 12px;text-align:left">Time</th>
@@ -142,7 +142,7 @@ def send_email_alert(available_slots):
         <tbody>{rows}</tbody>
       </table>
       <p><a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
-        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Open booking page ג†’</a></p>
+        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Open booking page →</a></p>
       <p style="color:#888;font-size:12px">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     </body></html>
     """
@@ -150,7 +150,7 @@ def send_email_alert(available_slots):
     payload = {
         "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
         "from": {"email": SENDER_EMAIL},
-        "subject": f"נ¨ Last Supper ג€” {len(available_slots)} slot(s) available now!",
+        "subject": f"🎨 Last Supper — {len(available_slots)} slot(s) available now!",
         "content": [{"type": "text/html", "value": html_body}]
     }
 
@@ -162,7 +162,7 @@ def send_email_alert(available_slots):
             timeout=30
         )
         if resp.status_code == 202:
-            log.info(f"ג… Alert email sent to {RECIPIENT_EMAIL}")
+            log.info(f"✅ Alert email sent to {RECIPIENT_EMAIL}")
         else:
             log.error(f"SendGrid error {resp.status_code}: {resp.text}")
     except Exception as e:
@@ -183,7 +183,7 @@ def main():
         if status == "available":
             current_pcodes = set(s["pcode"] for s in available_slots)
             if last_available_slots is None or not current_pcodes.issubset(last_available_slots):
-                log.info("New slots detected ג€” sending alert!")
+                log.info("New slots detected — sending alert!")
                 send_email_alert(available_slots)
             last_available_slots = current_pcodes
         else:

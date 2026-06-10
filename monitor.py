@@ -39,7 +39,7 @@ def get_session_slots(session):
         "Referer": TARGET_URL,
         "X-Requested-With": "XMLHttpRequest",
         "Origin": "https://cenacolovinciano.vivaticket.it",
-        "Cookie": COOKIE or "",
+        "Cookie": (COOKIE or "").strip(),
     }
     data = {
         "ajax": "1",

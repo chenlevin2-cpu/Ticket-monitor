@@ -2,18 +2,15 @@ import os
 import re
 import time
 import logging
-import smtplib
 import requests
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, date
 
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
@@ -24,7 +21,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-last_available_dates = None
+last_available_slots = None
 
 
 def fetch_with_zenrows():
@@ -49,29 +46,38 @@ def fetch_with_scraperapi():
     return resp.text
 
 
+def parse_available_slots(html):
+    """
+    Find all available time slots by looking for links with title="N seats".
+    Example: <a href="...&pcode=13771949&tcode=vt0005655" title="3 seats">12.30</a>
+    Returns list of dicts with pcode, seats, time.
+    """
+    # Match: pcode=XXXXXXX...title="N seats">TIME
+    pattern = r'pcode=(\d+)[^"]*"[^>]*title="(\d+)\s+seats?"[^>]*>([^<]+)</a>'
+    matches = re.findall(pattern, html, re.IGNORECASE)
+
+    slots = []
+    for pcode, seats, time_str in matches:
+        slots.append({
+            "pcode": pcode,
+            "seats": int(seats),
+            "time": time_str.strip(),
+        })
+
+    return slots
+
+
 def parse_sessions(html):
-    """
-    Parse the eventi JS array from the page.
-    Format: eventi['151991'].push(new Array('shopId','sessionId', new Date(year, month-1, day), '0', slots, '0'))
-    Returns list of dicts with date and slots available.
-    """
-    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\),\s*'(\d+)',\s*(\d+),\s*'(\d+)'\s*\)\s*\)"
+    """Parse the eventi JS array to map session IDs to dates."""
+    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\)"
     matches = re.findall(pattern, html)
-
-    sessions = []
+    sessions = {}
     for m in matches:
-        shop_id, session_id, year, month, day, unknown1, slots, unknown2 = m
+        _, session_id, year, month, day = m
         try:
-            session_date = date(int(year), int(month), int(day))
-            slots_available = int(slots)
-            sessions.append({
-                "date": session_date,
-                "session_id": session_id,
-                "slots": slots_available,
-            })
-        except Exception as e:
-            log.warning(f"Could not parse session: {m} — {e}")
-
+            sessions[session_id] = date(int(year), int(month), int(day))
+        except Exception:
+            pass
     return sessions
 
 
@@ -84,7 +90,6 @@ def check_availability():
             if html and len(html) > 500:
                 log.info(f"{name} succeeded ({len(html)} bytes)")
                 break
-            log.warning(f"{name} too small")
             html = None
         except Exception as e:
             log.warning(f"{name} failed: {e}")
@@ -93,113 +98,96 @@ def check_availability():
         log.error("All fetch methods failed")
         return "error", []
 
-    sessions = parse_sessions(html)
-    if not sessions:
-        log.warning("No session data found in page — structure may have changed")
-        return "unknown", []
+    # Find available slots (links with "N seats" title)
+    slots = parse_available_slots(html)
+    log.info(f"Available time slots found: {len(slots)}")
+    for s in slots:
+        log.info(f"  pcode={s['pcode']} time={s['time']} seats={s['seats']}")
 
-    available = [s for s in sessions if s["slots"] > 0]
-    sold_out = [s for s in sessions if s["slots"] == 0]
-
-    log.info(f"Sessions found: {len(sessions)} total, {len(available)} available, {len(sold_out)} sold out")
-    for s in sessions:
-        status = f"{s['slots']} slots" if s['slots'] > 0 else "SOLD OUT"
-        log.info(f"  {s['date'].strftime('%d %b %Y')} ({s['session_id']}): {status}")
-
-    if available:
-        return "available", available
+    if slots:
+        return "available", slots
     else:
+        log.info("No available slots found ג€” all sold out")
         return "sold_out", []
 
 
-def send_email_alert(available_sessions):
-    log.info(f"Attempting to send email from {SENDER_EMAIL} to {RECIPIENT_EMAIL}")
-
-    if not SENDER_EMAIL:
-        log.error("SENDER_EMAIL is not set")
+def send_email_alert(available_slots):
+    if not SENDGRID_API_KEY:
+        log.error("SENDGRID_API_KEY not set ג€” sign up free at sendgrid.com")
         return
-    if not SENDER_PASSWORD:
-        log.error("SENDER_PASSWORD is not set")
-        return
-    if not RECIPIENT_EMAIL:
-        log.error("RECIPIENT_EMAIL is not set")
+    if not RECIPIENT_EMAIL or not SENDER_EMAIL:
+        log.error("RECIPIENT_EMAIL or SENDER_EMAIL not set")
         return
 
-    # Build the dates table
-    rows = ""
-    for s in available_sessions:
-        rows += f"""
-        <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;">{s['date'].strftime('%A, %d %B %Y')}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold;">{s['slots']} slots</td>
-        </tr>"""
+    rows = "".join(
+        f"<tr>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>{s['time']}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold'>{s['seats']} seats</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee'>"
+        f"<a href='https://cenacolovinciano.vivaticket.it/index.php?nvpg[sell]&cmd=prices&wms_op=cenacoloVinciano&pcode={s[\"pcode\"]}&tcode=vt0005655' style='color:#185FA5'>Book this slot</a>"
+        f"</td></tr>"
+        for s in available_slots
+    )
 
     html_body = f"""
-    <html><body style="font-family:sans-serif;max-width:560px;margin:auto;padding:24px;">
-      <h2 style="color:#3B6D11;">🎨 Last Supper tickets available!</h2>
-      <p>The following dates have availability right now:</p>
-      <table style="width:100%;border-collapse:collapse;margin:16px 0;">
-        <thead>
-          <tr style="background:#f5f5f5;">
-            <th style="padding:8px 12px;text-align:left;">Date</th>
-            <th style="padding:8px 12px;text-align:center;">Slots</th>
-          </tr>
-        </thead>
+    <html><body style="font-family:sans-serif;max-width:580px;margin:auto;padding:24px;">
+      <h2 style="color:#3B6D11;">נ¨ Last Supper tickets available!</h2>
+      <p>The following time slots are bookable right now ג€” act fast!</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0">
+        <thead><tr style="background:#f5f5f5">
+          <th style="padding:8px 12px;text-align:left">Time</th>
+          <th style="padding:8px 12px;text-align:center">Seats</th>
+          <th style="padding:8px 12px;text-align:left">Link</th>
+        </tr></thead>
         <tbody>{rows}</tbody>
       </table>
-      <p>
-        <a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
-        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Book now →</a>
-      </p>
-      <p style="color:#888;font-size:12px;">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
+      <p><a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
+        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Open booking page ג†’</a></p>
+      <p style="color:#888;font-size:12px">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     </body></html>
     """
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🎨 Last Supper — {len(available_sessions)} date(s) available!"
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
-    msg.attach(MIMEText(html_body, "html"))
+    payload = {
+        "personalizations": [{"to": [{"email": RECIPIENT_EMAIL}]}],
+        "from": {"email": SENDER_EMAIL},
+        "subject": f"נ¨ Last Supper ג€” {len(available_slots)} slot(s) available now!",
+        "content": [{"type": "text/html", "value": html_body}]
+    }
 
     try:
-        log.info("Connecting to Gmail SMTP...")
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-            log.info("Connected. Logging in...")
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            log.info("Logged in. Sending...")
-            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        log.info(f"✅ Alert email sent successfully to {RECIPIENT_EMAIL}")
-    except smtplib.SMTPAuthenticationError as e:
-        log.error(f"Gmail authentication failed — check SENDER_PASSWORD is an App Password, not your login password. Error: {e}")
-    except smtplib.SMTPException as e:
-        log.error(f"SMTP error: {e}")
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            json=payload,
+            headers={"Authorization": f"Bearer {SENDGRID_API_KEY}"},
+            timeout=30
+        )
+        if resp.status_code == 202:
+            log.info(f"ג… Alert email sent to {RECIPIENT_EMAIL}")
+        else:
+            log.error(f"SendGrid error {resp.status_code}: {resp.text}")
     except Exception as e:
-        log.error(f"Failed to send email: {type(e).__name__}: {e}")
+        log.error(f"Failed to send email: {e}")
 
 
 def main():
-    global last_available_dates
+    global last_available_slots
     log.info("=== Cenacolo Vinciano Ticket Monitor Started ===")
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
 
     while True:
         log.info("Checking availability...")
-        status, available_sessions = check_availability()
+        status, available_slots = check_availability()
         log.info(f"Status: {status}")
 
         if status == "available":
-            # Get set of currently available date strings
-            current_dates = set(s["date"].isoformat() for s in available_sessions)
-
-            # Alert if this is the first check, or if new dates appeared
-            if last_available_dates is None or not current_dates.issubset(last_available_dates):
-                log.info("New availability detected — sending alert!")
-                send_email_alert(available_sessions)
-
-            last_available_dates = current_dates
+            current_pcodes = set(s["pcode"] for s in available_slots)
+            if last_available_slots is None or not current_pcodes.issubset(last_available_slots):
+                log.info("New slots detected ג€” sending alert!")
+                send_email_alert(available_slots)
+            last_available_slots = current_pcodes
         else:
-            last_available_dates = set()
+            last_available_slots = set()
 
         log.info(f"Next check in {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)

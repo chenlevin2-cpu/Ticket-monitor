@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import logging
 import requests
@@ -12,7 +11,6 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,6 +20,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 last_available_sessions = None
+
+# Hardcoded target sessions — no need to scrape the page
+TARGET_SESSIONS = [
+    {"session_id": "13792815", "shop_id": "vt0005655", "date": date(2026, 8, 18)},
+    {"session_id": "13792822", "shop_id": "vt0005655", "date": date(2026, 8, 19)},
+]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -33,41 +37,8 @@ HEADERS = {
 }
 
 
-def fetch_main_page():
-    """Use ZenRows to get the eventi array with all session IDs and dates."""
-    params = {
-        "apikey": ZENROWS_API_KEY,
-        "url": TARGET_URL,
-        "js_render": "true",
-        "wait": "3000",
-        "premium_proxy": "true",
-    }
-    resp = requests.get("https://api.zenrows.com/v1/", params=params, timeout=90)
-    resp.raise_for_status()
-    return resp.text
-
-
-def parse_sessions(html):
-    """Parse eventi JS array to get session IDs and dates."""
-    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\)"
-    sessions = []
-    for shop_id, session_id, year, month, day in re.findall(pattern, html):
-        try:
-            sessions.append({
-                "session_id": session_id,
-                "shop_id": shop_id,
-                "date": date(int(year), int(month), int(day)),
-            })
-        except Exception:
-            pass
-    return sessions
-
-
 def get_session_slots(session):
-    """
-    Call the eventoWidgetTlite.php API for a session.
-    Returns list of available time slots (where d=1).
-    """
+    """Call the eventoWidgetTlite.php API. Returns available slots (d=1)."""
     data = {
         "ajax": "1",
         "cal": "1",
@@ -79,42 +50,27 @@ def get_session_slots(session):
         resp = requests.post(API_URL, data=data, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         slots = resp.json()
+        log.info(f"  Raw API response for {session['date']}: {slots}")
         available = [s for s in slots if str(s.get("d", "0")) == "1"]
         return available
     except Exception as e:
-        log.warning(f"API call failed for session {session['session_id']}: {e}")
+        log.warning(f"API call failed for {session['date']}: {e}")
         return []
 
 
 def check_availability():
-    # Step 1: Get session list
-    try:
-        log.info("Fetching session list...")
-        html = fetch_main_page()
-        log.info(f"Main page: {len(html)} bytes")
-    except Exception as e:
-        log.error(f"Failed to fetch main page: {e}")
-        return "error", []
-
-    sessions = parse_sessions(html)
-    if not sessions:
-        log.warning("No sessions found")
-        return "unknown", []
-
-    target_dates = {date(2026, 8, 18), date(2026, 8, 19)}
-    upcoming = [s for s in sessions if s["date"] in target_dates]
-    log.info(f"Checking {len(upcoming)} target sessions (Aug 18 & 19)...")
-
+    log.info("Checking Aug 18 & 19 via API...")
     available_sessions = []
-    for s in upcoming:
+
+    for s in TARGET_SESSIONS:
         slots = get_session_slots(s)
         if slots:
-            times = [slot.get("ora", "?") for slot in slots]
-            log.info(f"  {s['date'].strftime('%d %b %Y')} ({s['session_id']}): AVAILABLE at {', '.join(times)}")
+            times = ", ".join(slot.get("ora", "?") for slot in slots)
+            log.info(f"  {s['date'].strftime('%d %b %Y')}: AVAILABLE at {times}")
             available_sessions.append({**s, "slots": slots})
         else:
-            log.info(f"  {s['date'].strftime('%d %b %Y')} ({s['session_id']}): sold out")
-        time.sleep(0.3)
+            log.info(f"  {s['date'].strftime('%d %b %Y')}: sold out")
+        time.sleep(0.5)
 
     if available_sessions:
         return "available", available_sessions
@@ -178,6 +134,7 @@ def main():
     global last_available_sessions
     log.info("=== Cenacolo Vinciano Ticket Monitor Started ===")
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
+    log.info(f"Watching: Aug 18 (13792815) & Aug 19 (13792822)")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
 
     while True:

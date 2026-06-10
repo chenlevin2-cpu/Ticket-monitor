@@ -10,11 +10,11 @@ from datetime import datetime
 
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))  # default 30 min (free tier: 1000 req/month)
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "1800"))
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")  # from scraperapi.com (free)
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,61 +25,106 @@ log = logging.getLogger(__name__)
 
 last_status = None
 
+SOLD_SIGNALS = [
+    "sold out", "esaurito", "biglietti esauriti", "not available",
+    "no availability", "nessuna data disponibile", "no dates available"
+]
+AVAIL_SIGNALS = [
+    "add to cart", "acquista", "aggiungi al carrello",
+    "buy now", "compra ora", "book now", "select date", "scegli data"
+]
 
-def fetch_page():
-    """Fetch page via ScraperAPI to bypass bot detection."""
-    if not SCRAPER_API_KEY:
-        log.error("SCRAPER_API_KEY not set — sign up free at scraperapi.com")
+
+def fetch_via_scraperapi():
+    """Use ScraperAPI without render=true (1 credit per call, not 5)."""
+    url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={TARGET_URL}"
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.text
+
+
+def fetch_via_zenrows():
+    """ZenRows free tier alternative — 1000 free credits."""
+    zenrows_key = os.environ.get("ZENROWS_API_KEY", "")
+    if not zenrows_key:
         return None
-
-    proxy_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={TARGET_URL}&render=true"
-    try:
-        resp = requests.get(proxy_url, timeout=60)
-        resp.raise_for_status()
-        log.info(f"Page fetched: {len(resp.text)} bytes")
-        return resp.text
-    except Exception as e:
-        log.error(f"Fetch failed: {e}")
-        return None
+    url = f"https://api.zenrows.com/v1/?apikey={zenrows_key}&url={TARGET_URL}&js_render=true"
+    resp = requests.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.text
 
 
-def check_availability():
-    html = fetch_page()
-    if not html:
-        return "error"
+def fetch_direct():
+    """Try direct fetch with realistic browser headers."""
+    session = requests.Session()
+    # First visit the homepage to get cookies
+    session.get("https://cenacolovinciano.vivaticket.it/", timeout=20, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    time.sleep(2)
+    resp = session.get(TARGET_URL, timeout=20, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Referer": "https://cenacolovinciano.vivaticket.it/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    resp.raise_for_status()
+    return resp.text
 
+
+def analyze(html):
+    """Parse HTML and return availability status."""
     text = html.lower()
+    log.info(f"Page size: {len(html)} bytes")
 
-    # Log any useful keywords found
-    for keyword in ["esaurito", "sold out", "acquista", "available", "cart",
-                    "compra", "book", "date", "biglietti", "tickets"]:
+    for keyword in ["esaurito", "sold", "acquista", "available", "cart", "compra", "book", "biglietti"]:
         idx = text.find(keyword)
         if idx != -1:
             snippet = text[max(0, idx-40):idx+60].replace("\n", " ").strip()
             log.info(f"  '{keyword}': ...{snippet}...")
 
-    sold_signals = [
-        "sold out", "esaurito", "biglietti esauriti",
-        "not available", "no availability", "nessuna data disponibile",
-        "no dates available"
-    ]
-    avail_signals = [
-        "add to cart", "acquista", "aggiungi al carrello",
-        "buy now", "compra ora", "book now", "select date",
-        "scegli data", "purchase"
-    ]
-
-    is_sold = any(s in text for s in sold_signals)
-    is_avail = any(s in text for s in avail_signals)
+    is_sold = any(s in text for s in SOLD_SIGNALS)
+    is_avail = any(s in text for s in AVAIL_SIGNALS)
 
     if is_avail and not is_sold:
         return "available"
     elif is_sold:
         return "sold_out"
     else:
-        sample = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html))[:600]
-        log.info(f"Page text sample: {sample}")
+        sample = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html))[:400]
+        log.info(f"Text sample: {sample}")
         return "unknown"
+
+
+def check_availability():
+    # Try each method in order
+    methods = [
+        ("ScraperAPI", fetch_via_scraperapi),
+        ("ZenRows", fetch_via_zenrows),
+        ("Direct", fetch_direct),
+    ]
+
+    for name, fetch_fn in methods:
+        try:
+            log.info(f"Trying {name}...")
+            html = fetch_fn()
+            if html and len(html) > 500:
+                log.info(f"{name} succeeded ({len(html)} bytes)")
+                return analyze(html)
+            else:
+                log.warning(f"{name} returned too little content ({len(html) if html else 0} bytes)")
+        except Exception as e:
+            log.warning(f"{name} failed: {e}")
+
+    log.error("All fetch methods failed")
+    return "error"
 
 
 def send_email_alert():

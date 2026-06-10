@@ -1,18 +1,18 @@
 import os
 import time
-import json
 import logging
 import requests
 from datetime import datetime, date
 
 # --- Configuration ---
-TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
 API_URL = "https://cenacolovinciano.vivaticket.it/eventoWidgetTlite.php"
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))  # 5 min default
+TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-COOKIE = os.environ.get("VIVATICKET_COOKIE")
+PROXY_USER = os.environ.get("PROXY_USER")
+PROXY_PASS = os.environ.get("PROXY_PASS")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,33 +28,41 @@ TARGET_SESSIONS = [
     {"session_id": "13792822", "shop_id": "vt0005655", "date": date(2026, 8, 19)},
 ]
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Referer": TARGET_URL,
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": "https://cenacolovinciano.vivaticket.it",
+}
+
+
+def get_proxies():
+    if PROXY_USER and PROXY_PASS:
+        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@p.webshare.io:80"
+        return {"http": proxy_url, "https": proxy_url}
+    return None
+
 
 def get_session_slots(session):
-    """Call eventoWidgetTlite.php with browser cookie to bypass Incapsula."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Referer": TARGET_URL,
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": "https://cenacolovinciano.vivaticket.it",
-        "Cookie": (COOKIE or "").strip(),
-    }
     data = {
-        "ajax": "1",
-        "cal": "1",
+        "ajax": "1", "cal": "1",
         "tcode": session["shop_id"],
         "pcode": session["session_id"],
         "seat-filter": "undefined",
     }
     try:
-        resp = requests.post(API_URL, data=data, headers=headers, timeout=15)
+        proxies = get_proxies()
+        if proxies:
+            log.info(f"  Using residential proxy for {session['date']}")
+        resp = requests.post(API_URL, data=data, headers=HEADERS,
+                           proxies=proxies, timeout=20)
         log.info(f"  {session['date']}: status={resp.status_code} body={resp.text[:200]}")
         if resp.status_code == 200 and resp.text.strip().startswith("["):
             slots = resp.json()
-            available = [s for s in slots if str(s.get("d", "0")) == "1"]
-            return available
+            return [s for s in slots if str(s.get("d", "0")) == "1"]
         return []
     except Exception as e:
         log.warning(f"  API call failed for {session['date']}: {e}")
@@ -137,8 +145,7 @@ def main():
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
     log.info(f"Watching: Aug 18 & Aug 19 2026")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
-    if not COOKIE:
-        log.warning("VIVATICKET_COOKIE not set — requests may be blocked")
+    log.info(f"Proxy: {'enabled' if PROXY_USER else 'not set'}")
 
     while True:
         log.info("Checking availability...")

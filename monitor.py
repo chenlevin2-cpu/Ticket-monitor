@@ -25,104 +25,110 @@ log = logging.getLogger(__name__)
 
 last_status = None
 
+# These indicate the WHOLE event is sold out (no dates at all)
 SOLD_SIGNALS = [
-    "sold out", "esaurito", "biglietti esauriti", "not available",
-    "no availability", "nessuna data disponibile", "no dates available"
+    "esaurito", "biglietti esauriti", "nessuna data disponibile",
+    "no dates available", "evento non disponibile"
 ]
+
+# These indicate at least one date has a buyable ticket
+# Must be action-oriented (a button/link), not just page text
 AVAIL_SIGNALS = [
-    "add to cart", "acquista", "aggiungi al carrello",
-    "buy now", "compra ora", "book now", "select date", "scegli data"
+    "aggiungi al carrello",
+    "add to cart",
+    "compra ora",
+    "buy now",
+    "acquista ora",
+]
+
+# These are date-slot level sold-out markers — presence alone doesn't mean
+# the whole event is unavailable
+SLOT_SOLD_SIGNALS = [
+    "sold out",
+    "not available",
+    "no availability",
 ]
 
 
 def fetch_via_scraperapi():
-    """Use ScraperAPI without render=true (1 credit per call, not 5)."""
     url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={TARGET_URL}"
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return resp.text
 
 
-def fetch_via_zenrows():
-    """ZenRows free tier alternative — 1000 free credits."""
-    zenrows_key = os.environ.get("ZENROWS_API_KEY", "")
-    if not zenrows_key:
-        return None
-    url = f"https://api.zenrows.com/v1/?apikey={zenrows_key}&url={TARGET_URL}&js_render=true"
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    return resp.text
-
-
 def fetch_direct():
-    """Try direct fetch with realistic browser headers."""
     session = requests.Session()
-    # First visit the homepage to get cookies
     session.get("https://cenacolovinciano.vivaticket.it/", timeout=20, headers={
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
     })
     time.sleep(2)
     resp = session.get(TARGET_URL, timeout=20, headers={
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://cenacolovinciano.vivaticket.it/",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     })
     resp.raise_for_status()
     return resp.text
 
 
 def analyze(html):
-    """Parse HTML and return availability status."""
     text = html.lower()
     log.info(f"Page size: {len(html)} bytes")
 
-    for keyword in ["esaurito", "sold", "acquista", "available", "cart", "compra", "book", "biglietti"]:
-        idx = text.find(keyword)
-        if idx != -1:
-            snippet = text[max(0, idx-40):idx+60].replace("\n", " ").strip()
+    # Log all relevant keywords found with context
+    for keyword in ["esaurito", "sold out", "acquista", "add to cart", "compra",
+                    "aggiungi", "buy now", "not available", "disponib"]:
+        idx = 0
+        while True:
+            idx = text.find(keyword, idx)
+            if idx == -1:
+                break
+            snippet = text[max(0, idx-50):idx+80].replace("\n", " ").strip()
             log.info(f"  '{keyword}': ...{snippet}...")
+            idx += len(keyword)
 
-    is_sold = any(s in text for s in SOLD_SIGNALS)
+    # Check for action signals (buttons to actually buy)
     is_avail = any(s in text for s in AVAIL_SIGNALS)
 
-    if is_avail and not is_sold:
+    # Check for hard sold-out (whole event unavailable)
+    is_hard_sold = any(s in text for s in SOLD_SIGNALS)
+
+    log.info(f"  -> Buy button found: {is_avail} | Hard sold-out: {is_hard_sold}")
+
+    if is_avail and not is_hard_sold:
         return "available"
-    elif is_sold:
+    elif is_hard_sold and not is_avail:
         return "sold_out"
-    else:
-        sample = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html))[:400]
+    elif not is_avail and not is_hard_sold:
+        # Dump a text sample to help diagnose
+        sample = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html))[:600]
         log.info(f"Text sample: {sample}")
         return "unknown"
+    else:
+        # Both signals present — some dates available, some not
+        return "available"
 
 
 def check_availability():
-    # Try each method in order
     methods = [
         ("ScraperAPI", fetch_via_scraperapi),
-        ("ZenRows", fetch_via_zenrows),
         ("Direct", fetch_direct),
     ]
-
-    for name, fetch_fn in methods:
+    for name, fn in methods:
         try:
             log.info(f"Trying {name}...")
-            html = fetch_fn()
+            html = fn()
             if html and len(html) > 500:
-                log.info(f"{name} succeeded ({len(html)} bytes)")
+                log.info(f"{name} succeeded")
                 return analyze(html)
             else:
-                log.warning(f"{name} returned too little content ({len(html) if html else 0} bytes)")
+                log.warning(f"{name} too small ({len(html) if html else 0} bytes)")
         except Exception as e:
             log.warning(f"{name} failed: {e}")
-
     log.error("All fetch methods failed")
     return "error"
 
@@ -134,18 +140,18 @@ def send_email_alert():
 
     html_body = f"""
     <html><body style="font-family:sans-serif;max-width:520px;margin:auto;padding:24px;">
-      <h2 style="color:#3B6D11;">Tickets may be available!</h2>
-      <p>The monitor detected availability on the Cenacolo Vinciano booking page. Act fast!</p>
+      <h2 style="color:#3B6D11;">🎨 Tickets are available!</h2>
+      <p>The monitor detected availability on the Cenacolo Vinciano booking page. Act fast — these go quickly!</p>
       <p>
-        <a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:10px 20px;
-        border-radius:8px;text-decoration:none;font-weight:bold;">Book now</a>
+        <a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
+        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Book now →</a>
       </p>
       <p style="color:#888;font-size:12px;">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     </body></html>
     """
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = "Cenacolo Vinciano — Tickets Available!"
+    msg["Subject"] = "🎨 Cenacolo Vinciano — Tickets Available!"
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html_body, "html"))

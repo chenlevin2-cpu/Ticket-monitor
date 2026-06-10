@@ -1,1 +1,1 @@
-worker: python monitor.py
+worker: playwright install chromium && python monitor.py

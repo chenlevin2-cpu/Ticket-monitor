@@ -101,9 +101,9 @@ def check_availability():
         log.warning("No sessions found")
         return "unknown", []
 
-    today = date.today()
-    upcoming = [s for s in sessions if 0 <= (s["date"] - today).days <= 60]
-    log.info(f"Checking {len(upcoming)} sessions via API...")
+    target_dates = {date(2026, 8, 18), date(2026, 8, 19)}
+    upcoming = [s for s in sessions if s["date"] in target_dates]
+    log.info(f"Checking {len(upcoming)} target sessions (Aug 18 & 19)...")
 
     available_sessions = []
     for s in upcoming:

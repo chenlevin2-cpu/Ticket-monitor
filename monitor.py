@@ -6,7 +6,7 @@ import smtplib
 import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, date
 
 # --- Configuration ---
 TARGET_URL = "https://cenacolovinciano.vivaticket.it/en/event/cenacolo-vinciano/151991?idt=2547"
@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-last_status = None
+last_available_dates = None
 
 
 def fetch_with_zenrows():
@@ -49,123 +49,158 @@ def fetch_with_scraperapi():
     return resp.text
 
 
-def analyze_html(html):
-    log.info(f"Page size: {len(html)} bytes")
+def parse_sessions(html):
+    """
+    Parse the eventi JS array from the page.
+    Format: eventi['151991'].push(new Array('shopId','sessionId', new Date(year, month-1, day), '0', slots, '0'))
+    Returns list of dicts with date and slots available.
+    """
+    pattern = r"eventi\['\d+'\]\.push\(new Array\s*\('([^']+)',\s*'([^']+)',\s*new Date\s*\((\d+),\s*\((\d+)-1\),\s*(\d+)\),\s*'(\d+)',\s*(\d+),\s*'(\d+)'\s*\)\s*\)"
+    matches = re.findall(pattern, html)
 
-    # Strip tags and get clean text
-    clean = re.sub(r'<[^>]+>', ' ', html)
-    clean = re.sub(r'\s+', ' ', clean).strip()
+    sessions = []
+    for m in matches:
+        shop_id, session_id, year, month, day, unknown1, slots, unknown2 = m
+        try:
+            session_date = date(int(year), int(month), int(day))
+            slots_available = int(slots)
+            sessions.append({
+                "date": session_date,
+                "session_id": session_id,
+                "slots": slots_available,
+            })
+        except Exception as e:
+            log.warning(f"Could not parse session: {m} — {e}")
 
-    # Log a large chunk of the visible text so we can see what buttons/text exist
-    log.info(f"=== PAGE TEXT (first 1500 chars) ===")
-    log.info(clean[:750])
-    log.info(clean[750:1500])
-    log.info(f"=== END PAGE TEXT ===")
-
-    # Also search for the sell_online section specifically
-    sell_idx = html.lower().find('sell_online')
-    if sell_idx != -1:
-        section = html[sell_idx:sell_idx+2000]
-        section_clean = re.sub(r'<[^>]+>', ' ', section)
-        section_clean = re.sub(r'\s+', ' ', section_clean).strip()
-        log.info(f"=== sell_online SECTION ===")
-        log.info(section_clean[:800])
-        log.info(f"=== END sell_online ===")
-
-    # Search for any input/button/link text
-    buttons = re.findall(r'<(?:button|input|a)[^>]*>([^<]{2,60})</(?:button|a)>', html, re.IGNORECASE)
-    if buttons:
-        log.info(f"Buttons/links found: {buttons[:20]}")
-
-    text = html.lower()
-
-    # Hard sold-out signals
-    hard_sold = ["esaurito", "biglietti esauriti", "nessuna data disponibile",
-                 "no dates available", "evento non disponibile"]
-    # Any of these in the sell section = available
-    avail_signals = ["aggiungi al carrello", "add to cart", "compra ora",
-                     "buy now", "acquista ora", "select tickets",
-                     '"available":true', '"available": true',
-                     '"soldout":false', '"sold_out":false',
-                     'type="submit"', "proceed to checkout", "checkout"]
-
-    is_avail = any(s in text for s in avail_signals)
-    is_sold = any(s in text for s in hard_sold)
-
-    log.info(f"Available signals: {is_avail} | Sold-out signals: {is_sold}")
-
-    if is_avail and not is_sold:
-        return "available"
-    elif is_sold and not is_avail:
-        return "sold_out"
-    elif is_avail and is_sold:
-        return "available"  # some dates available, some not
-    return "unknown"
+    return sessions
 
 
 def check_availability():
+    html = None
     for name, fn in [("ZenRows", fetch_with_zenrows), ("ScraperAPI", fetch_with_scraperapi)]:
         try:
             log.info(f"Trying {name}...")
             html = fn()
             if html and len(html) > 500:
                 log.info(f"{name} succeeded ({len(html)} bytes)")
-                return analyze_html(html)
-            log.warning(f"{name} too small ({len(html) if html else 0} bytes)")
+                break
+            log.warning(f"{name} too small")
+            html = None
         except Exception as e:
             log.warning(f"{name} failed: {e}")
-    log.error("All fetch methods failed")
-    return "error"
+
+    if not html:
+        log.error("All fetch methods failed")
+        return "error", []
+
+    sessions = parse_sessions(html)
+    if not sessions:
+        log.warning("No session data found in page — structure may have changed")
+        return "unknown", []
+
+    available = [s for s in sessions if s["slots"] > 0]
+    sold_out = [s for s in sessions if s["slots"] == 0]
+
+    log.info(f"Sessions found: {len(sessions)} total, {len(available)} available, {len(sold_out)} sold out")
+    for s in sessions:
+        status = f"{s['slots']} slots" if s['slots'] > 0 else "SOLD OUT"
+        log.info(f"  {s['date'].strftime('%d %b %Y')} ({s['session_id']}): {status}")
+
+    if available:
+        return "available", available
+    else:
+        return "sold_out", []
 
 
-def send_email_alert():
-    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
-        log.error("Email credentials missing.")
+def send_email_alert(available_sessions):
+    log.info(f"Attempting to send email from {SENDER_EMAIL} to {RECIPIENT_EMAIL}")
+
+    if not SENDER_EMAIL:
+        log.error("SENDER_EMAIL is not set")
+        return
+    if not SENDER_PASSWORD:
+        log.error("SENDER_PASSWORD is not set")
+        return
+    if not RECIPIENT_EMAIL:
+        log.error("RECIPIENT_EMAIL is not set")
         return
 
+    # Build the dates table
+    rows = ""
+    for s in available_sessions:
+        rows += f"""
+        <tr>
+          <td style="padding:8px 12px;border-bottom:1px solid #eee;">{s['date'].strftime('%A, %d %B %Y')}</td>
+          <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center;color:#3B6D11;font-weight:bold;">{s['slots']} slots</td>
+        </tr>"""
+
     html_body = f"""
-    <html><body style="font-family:sans-serif;max-width:520px;margin:auto;padding:24px;">
-      <h2 style="color:#3B6D11;">Tickets are available!</h2>
-      <p>The monitor detected availability on the Cenacolo Vinciano booking page. Act fast!</p>
+    <html><body style="font-family:sans-serif;max-width:560px;margin:auto;padding:24px;">
+      <h2 style="color:#3B6D11;">🎨 Last Supper tickets available!</h2>
+      <p>The following dates have availability right now:</p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;">
+        <thead>
+          <tr style="background:#f5f5f5;">
+            <th style="padding:8px 12px;text-align:left;">Date</th>
+            <th style="padding:8px 12px;text-align:center;">Slots</th>
+          </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+      </table>
       <p>
         <a href="{TARGET_URL}" style="background:#185FA5;color:#fff;padding:12px 24px;
-        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Book now</a>
+        border-radius:8px;text-decoration:none;font-weight:bold;font-size:16px;">Book now →</a>
       </p>
       <p style="color:#888;font-size:12px;">Detected at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC</p>
     </body></html>
     """
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = "Cenacolo Vinciano — Tickets Available!"
+    msg["Subject"] = f"🎨 Last Supper — {len(available_sessions)} date(s) available!"
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html_body, "html"))
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        log.info("Connecting to Gmail SMTP...")
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            log.info("Connected. Logging in...")
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            log.info("Logged in. Sending...")
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        log.info(f"Alert email sent to {RECIPIENT_EMAIL}")
+        log.info(f"✅ Alert email sent successfully to {RECIPIENT_EMAIL}")
+    except smtplib.SMTPAuthenticationError as e:
+        log.error(f"Gmail authentication failed — check SENDER_PASSWORD is an App Password, not your login password. Error: {e}")
+    except smtplib.SMTPException as e:
+        log.error(f"SMTP error: {e}")
     except Exception as e:
-        log.error(f"Failed to send email: {e}")
+        log.error(f"Failed to send email: {type(e).__name__}: {e}")
 
 
 def main():
-    global last_status
+    global last_available_dates
     log.info("=== Cenacolo Vinciano Ticket Monitor Started ===")
     log.info(f"Notifying: {RECIPIENT_EMAIL}")
     log.info(f"Check interval: {CHECK_INTERVAL}s")
 
     while True:
         log.info("Checking availability...")
-        status = check_availability()
+        status, available_sessions = check_availability()
         log.info(f"Status: {status}")
 
-        if status == "available" and last_status != "available":
-            log.info("*** TICKETS AVAILABLE — sending alert! ***")
-            send_email_alert()
+        if status == "available":
+            # Get set of currently available date strings
+            current_dates = set(s["date"].isoformat() for s in available_sessions)
 
-        last_status = status
+            # Alert if this is the first check, or if new dates appeared
+            if last_available_dates is None or not current_dates.issubset(last_available_dates):
+                log.info("New availability detected — sending alert!")
+                send_email_alert(available_sessions)
+
+            last_available_dates = current_dates
+        else:
+            last_available_dates = set()
+
         log.info(f"Next check in {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 

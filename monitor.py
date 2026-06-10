@@ -41,7 +41,8 @@ HEADERS = {
 
 def get_proxies():
     if PROXY_USER and PROXY_PASS:
-        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@p.webshare.io:80"
+        proxy_host = os.environ.get("PROXY_HOST", "p.webshare.io:80")
+        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{proxy_host}"
         return {"http": proxy_url, "https": proxy_url}
     return None
 
